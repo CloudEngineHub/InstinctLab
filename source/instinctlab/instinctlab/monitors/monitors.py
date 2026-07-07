@@ -252,6 +252,40 @@ class ActuatorMonitorTerm(MonitorTerm):
             }
 
 
+class ContactForceMonitorTerm(MonitorTerm):
+    """Monitors net contact forces on selected sensor bodies. Logs mean and max force norms per step."""
+
+    def __init__(self, cfg: MonitorTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        from isaaclab.sensors import ContactSensor
+
+        self._contact_sensor: ContactSensor = env.scene.sensors[cfg.params["sensor_cfg"].name]
+        self._body_ids = cfg.params["sensor_cfg"].body_ids
+        self._force_mean = torch.zeros(env.num_envs, dtype=torch.float32, device=self.device)
+        self._force_max = torch.zeros(env.num_envs, dtype=torch.float32, device=self.device)
+
+    def update(self, dt: float):
+        net_forces = self._contact_sensor.data.net_forces_w_history
+        # net_forces shape: (num_envs, history_length, num_bodies, 3)
+        force_norms = torch.norm(net_forces[:, :, self._body_ids], dim=-1)
+        # max over history, then stats over selected bodies
+        force_norms_max_hist = force_norms.max(dim=1).values  # (num_envs, num_selected_bodies)
+        self._force_mean[:] = force_norms_max_hist.mean(dim=-1)
+        self._force_max[:] = force_norms_max_hist.max(dim=-1).values
+
+    def reset_idx(self, env_ids: Sequence[int] | slice):
+        self._force_mean[env_ids] = 0.0
+        self._force_max[env_ids] = 0.0
+
+    def get_log(self, is_episode=False) -> dict[str, float | torch.Tensor]:
+        if is_episode:
+            return {}
+        return {
+            "force_mean": self._force_mean.mean(),
+            "force_max": self._force_max.max(),
+        }
+
+
 class BodyStatMonitorTerm(MonitorTerm):
     """Measuring the performance of the body. E.g. body acc, body vel, body pos, action rate, etc."""
 
@@ -940,3 +974,74 @@ class ShadowingBasePosMonitorTerm(MonitorTerm):
             "reference_base_pos_y": self._reference_base_pos[:, 1].mean().item(),
             "reference_base_pos_z": self._reference_base_pos[:, 2].mean().item(),
         }
+
+
+class ShadowingGravityMonitorTerm(MonitorTerm):
+    """Monitors the projected gravity distance between the robot and the motion reference."""
+
+    def __init__(self, cfg: MonitorTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        if "robot_cfg" not in self.cfg.params:
+            self.cfg.params["robot_cfg"] = SceneEntityCfg("robot")
+        if "motion_reference_cfg" not in self.cfg.params:
+            self.cfg.params["motion_reference_cfg"] = SceneEntityCfg("motion_reference")
+
+        self._pg_diff = torch.zeros(self._env.num_envs, dtype=torch.float32, device=self.device)
+        self._pg_diff_currently = torch.zeros(self._env.num_envs, dtype=torch.float32, device=self.device)
+        self._pg_diff_max = torch.zeros(self._env.num_envs, dtype=torch.float32, device=self.device)
+        self._num_frames_should_reach = torch.zeros(self._env.num_envs, dtype=torch.int32, device=self.device)
+        self._all_ones = torch.ones(self._env.num_envs, dtype=torch.float32, device=self.device)
+
+    """
+    Operations
+    """
+
+    def update(self, dt: float):
+        motion_reference: MotionReferenceManager = self._env.scene[self.cfg.params["motion_reference_cfg"].name]
+
+        in_frame_mask = matching_reference_timing(
+            self._env,
+            self._all_ones,
+            motion_reference,
+            check_at_keyframe_threshold=self.cfg.params.get("check_at_keyframe_threshold", -1),  # type: ignore
+            multiply_by_frame_interval=False,
+        )
+
+        robot: Articulation = self._env.scene[self.cfg.params["robot_cfg"].name]
+        rot = robot.data.root_state_w[:, 3:7]
+        ref_rot = motion_reference.data.base_quat_w
+        ref_rot = ref_rot[motion_reference.ALL_INDICES, motion_reference.aiming_frame_idx]
+
+        pg = math_utils.quat_apply_inverse(rot, robot.data.GRAVITY_VEC_W)
+        ref_pg = math_utils.quat_apply_inverse(ref_rot, robot.data.GRAVITY_VEC_W)
+
+        if self.cfg.params.get("z_only", False):
+            diff = (pg[:, 2] - ref_pg[:, 2]).abs()
+        else:
+            diff = torch.norm(pg - ref_pg, dim=-1)
+
+        self._pg_diff += diff * in_frame_mask
+        self._pg_diff_currently = diff * in_frame_mask
+        self._pg_diff_max = torch.maximum(self._pg_diff_max, diff * in_frame_mask)
+        self._num_frames_should_reach += in_frame_mask.to(torch.int)
+
+    def reset_idx(self, env_ids: Sequence[int] | slice):
+        self._episodic_pg_diff = self._pg_diff[env_ids] / self._num_frames_should_reach[env_ids]
+        self._episodic_pg_diff_max = self._pg_diff_max[env_ids].clone()
+
+        self._pg_diff[env_ids] = 0.0
+        self._pg_diff_max[env_ids] = 0.0
+        self._num_frames_should_reach[env_ids] = 0
+
+    def get_log(self, is_episode=False) -> dict[str, float | torch.Tensor]:
+        if is_episode:
+            return {
+                "pg_dist_mean": self._episodic_pg_diff.nanmean().item(),
+                "pg_dist_max": self._episodic_pg_diff_max.max().item(),
+            }
+        else:
+            return {
+                "pg_dist_mean": (self._pg_diff / self._num_frames_should_reach).nanmean().item(),
+                "pg_dist_currently": self._pg_diff_currently.nanmean().item(),
+                "pg_dist_max": self._pg_diff_max.max().item(),
+            }
